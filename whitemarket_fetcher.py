@@ -380,6 +380,34 @@ def run_whitemarket_ingest(url: str = WHITEMARKET_URL) -> int:
         aggregated = {}
         raw_count = 0
         
+        def _to_usd(val, field_name: str):
+            v = val
+            if isinstance(v, str):
+                try:
+                    v = float(v.replace(",", ".").strip())
+                except Exception:
+                    return None
+            if field_name.endswith("_cents") and isinstance(v, (int, float)):
+                return float(v) / 100.0
+            if isinstance(v, int) and v >= 1000:
+                return float(v) / 100.0
+            try:
+                return float(v)
+            except Exception:
+                return None
+
+        def _normalize_price(p: dict) -> t.Optional[float]:
+            # tenta múltiplos campos comuns e retorna o menor valor válido
+            candidates = []
+            for f in ("price_usd", "price_cents", "price", "amount", "value"):
+                if f in p and p[f] is not None:
+                    usd = _to_usd(p[f], f)
+                    if usd is not None and usd > 0:
+                        candidates.append(usd)
+            if not candidates:
+                return None
+            return min(candidates)
+
         for product in products:
             if not product:
                 continue
@@ -387,8 +415,8 @@ def run_whitemarket_ingest(url: str = WHITEMARKET_URL) -> int:
             try:
                 # Processar item individual
                 market_hash_name = product.get("market_hash_name", "")
-                price = product.get("price")
-                qty = product.get("qty", 1)
+                price = _normalize_price(product)
+                qty = int(product.get("qty", 1) or 1)
                 
                 if not market_hash_name or not isinstance(price, (int, float)):
                     continue
@@ -401,10 +429,14 @@ def run_whitemarket_ingest(url: str = WHITEMARKET_URL) -> int:
                 
                 # Agregar na memória temporária (limitada)
                 if item_key in aggregated:
-                    aggregated[item_key]["price_whitemarket"] = min(
-                        aggregated[item_key]["price_whitemarket"], price
-                    )
-                    aggregated[item_key]["qty_whitemarket"] += qty
+                    # Sempre manter o MENOR preço encontrado para a variante
+                    try:
+                        cur = float(aggregated[item_key]["price_whitemarket"])
+                    except Exception:
+                        cur = None
+                    if cur is None or price < cur:
+                        aggregated[item_key]["price_whitemarket"] = price
+                    aggregated[item_key]["qty_whitemarket"] = int(aggregated[item_key].get("qty_whitemarket", 0)) + qty
                 else:
                     aggregated[item_key] = {
                         "item_key": item_key,

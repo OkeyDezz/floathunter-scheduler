@@ -414,14 +414,21 @@ def run_whitemarket_ingest(url: str = WHITEMARKET_URL) -> int:
                 
             try:
                 # Processar item individual
-                market_hash_name = product.get("market_hash_name", "")
+                # WhiteMarket pode usar vários campos de nome; usar fallback robusto
+                name = (
+                    product.get("name_hash")
+                    or product.get("market_hash_name")
+                    or product.get("hash_name")
+                    or product.get("name")
+                    or ""
+                )
                 price = _normalize_price(product)
                 qty = int(product.get("qty", 1) or 1)
                 
-                if not market_hash_name or not isinstance(price, (int, float)):
+                if not name or not isinstance(price, (int, float)):
                     continue
                     
-                name_base, stattrak, souvenir, condition = parse_market_hash_name(market_hash_name)
+                name_base, stattrak, souvenir, condition = parse_market_hash_name(str(name))
                 if not name_base:
                     continue
                     

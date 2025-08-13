@@ -12,6 +12,8 @@ from dotenv import load_dotenv
 import ijson
 
 WHITEMARKET_URL = "https://s3.white.market/export/v1/products/730.json"
+WHITEMARKET_PRICES_CSV = "https://s3.white.market/export/v1/prices/730.csv"
+WHITEMARKET_PRICES_JSON = "https://s3.white.market/export/v1/prices/730.json"
 # Desabilita HTTP/2 no httpx/postgrest para evitar RemoteProtocolError em lotes grandes
 os.environ.setdefault("HTTPX_DISABLE_HTTP2", "1")
 # Carrega .env do diretório deste arquivo (robusto contra cwd diferente)
@@ -364,7 +366,26 @@ def aggregate_whitemarket(products: t.Iterable[dict]) -> t.Dict[str, dict]:
     return acc
 
 
-def run_whitemarket_ingest(url: str = WHITEMARKET_URL) -> int:
+def iter_prices_csv(url: str = WHITEMARKET_PRICES_CSV) -> t.Iterable[dict]:
+    """Itera o CSV leve de preços do WhiteMarket (menor preço e contagem por item)."""
+    import csv
+    headers = {"Accept": "text/csv"}
+    api_token = os.environ.get("WHITEMARKET_API_TOKEN")
+    if api_token:
+        headers["Authorization"] = f"Bearer {api_token}"
+    with requests.get(url, headers=headers, stream=True, timeout=180) as resp:
+        resp.raise_for_status()
+        text_stream = io.TextIOWrapper(resp.raw, encoding='utf-8', errors='ignore')
+        reader = csv.DictReader(text_stream)
+        for row in reader:
+            yield {
+                "market_hash_name": row.get("market_hash_name") or "",
+                "price": row.get("price"),
+                "market_product_count": row.get("market_product_count"),
+            }
+
+
+def run_whitemarket_ingest(url: str = WHITEMARKET_URL, prefer_csv: bool = True) -> int:
     """Executa ingestão otimizada para economia de memória"""
     import gc
     
@@ -375,8 +396,13 @@ def run_whitemarket_ingest(url: str = WHITEMARKET_URL) -> int:
     print(f"[whitemarket] Iniciando com batch_size={batch_size}")
     
     try:
-        # Processar com streaming real para 27k+ itens
-        products = fetch_whitemarket(url)
+        # Escolhe fonte (CSV rápido por padrão)
+        if prefer_csv:
+            print(f"[whitemarket] Preferindo CSV: {WHITEMARKET_PRICES_CSV}")
+            products = iter_prices_csv(WHITEMARKET_PRICES_CSV)
+        else:
+            print(f"[whitemarket] Usando JSON de produtos: {url}")
+            products = fetch_whitemarket(url)
         aggregated = {}
         raw_count = 0
         
@@ -414,16 +440,28 @@ def run_whitemarket_ingest(url: str = WHITEMARKET_URL) -> int:
                 
             try:
                 # Processar item individual
-                # WhiteMarket pode usar vários campos de nome; usar fallback robusto
-                name = (
-                    product.get("name_hash")
-                    or product.get("market_hash_name")
-                    or product.get("hash_name")
-                    or product.get("name")
-                    or ""
-                )
-                price = _normalize_price(product)
-                qty = int(product.get("qty", 1) or 1)
+                if prefer_csv:
+                    name = product.get("market_hash_name") or ""
+                    price_str = product.get("price")
+                    qty_str = product.get("market_product_count")
+                    try:
+                        price = float(str(price_str).replace(",", ".").strip()) if price_str is not None else None
+                    except Exception:
+                        price = None
+                    try:
+                        qty = int(qty_str) if qty_str is not None and str(qty_str).strip() != '' else 0
+                    except Exception:
+                        qty = 0
+                else:
+                    name = (
+                        product.get("name_hash")
+                        or product.get("market_hash_name")
+                        or product.get("hash_name")
+                        or product.get("name")
+                        or ""
+                    )
+                    price = _normalize_price(product)
+                    qty = int(product.get("qty", 1) or 1)
                 
                 if not name or not isinstance(price, (int, float)):
                     continue

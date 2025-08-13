@@ -188,9 +188,6 @@ if __name__ == "__main__":
     count = run_whitemarket_ingest()
     print(f"[whitemarket] itens agregados: {count}")
 
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 import os
 import gzip
 import io

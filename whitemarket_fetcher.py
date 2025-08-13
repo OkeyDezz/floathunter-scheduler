@@ -1,6 +1,196 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+"""
+WhiteMarket (CSV) fast ingestor
+
+Lê o CSV leve de preços do WhiteMarket (prices/730.csv) que já traz:
+- market_hash_name (nome do item)
+- price (menor preço anunciado)
+- market_product_count (total de anúncios)
+
+Normaliza por (name_base, is_stattrak, is_souvenir, condition) e faz upsert
+na tabela SUPABASE_MARKET_TABLE (default: market_data), mantendo o MENOR
+preço por variante e somando qty.
+"""
+
+import os
+import io
+import csv
+from datetime import datetime, timezone
+import typing as t
+
+import requests
+
+# URLs de fonte
+WHITEMARKET_PRICES_CSV = os.environ.get(
+    "WHITEMARKET_PRICES_CSV",
+    "https://s3.white.market/export/v1/prices/730.csv",
+)
+
+# Supabase
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE") or os.environ.get("SUPABASE_SERVICE_KEY") or os.environ.get("SUPABASE_ANON_KEY")
+MARKET_TABLE = os.environ.get("SUPABASE_MARKET_TABLE", "market_data")
+UPSERT_BATCH = int(os.environ.get("SUPABASE_UPSERT_BATCH", "500"))
+
+
+def get_supabase_client():
+    from supabase import create_client
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        raise RuntimeError("SUPABASE_URL/SUPABASE_SERVICE_ROLE não configurados no ambiente")
+    return create_client(SUPABASE_URL, SUPABASE_KEY)
+
+
+def chunked(iterable, size: int):
+    buf = []
+    for x in iterable:
+        buf.append(x)
+        if len(buf) >= size:
+            yield buf
+            buf = []
+    if buf:
+        yield buf
+
+
+CONDITION_NAMES = [
+    "Factory New",
+    "Minimal Wear",
+    "Field-Tested",
+    "Well-Worn",
+    "Battle-Scarred",
+]
+
+
+def parse_market_hash_name(name: str) -> t.Tuple[str, bool, bool, t.Optional[str]]:
+    if not name:
+        return "", False, False, None
+    s = str(name)
+    stattrak = ("StatTrak™" in s) or ("StatTrak" in s)
+    souvenir = ("Souvenir" in s)
+    condition = None
+    for cond in CONDITION_NAMES:
+        suffix = f"({cond})"
+        if s.endswith(suffix):
+            condition = cond
+            s = s[: -len(suffix)].strip()
+            break
+    base = s.replace("StatTrak™ ", "").replace("StatTrak ", "").replace("Souvenir ", "").strip()
+    return base, stattrak, souvenir, condition
+
+
+def build_item_key(name_base: str, stattrak: bool, souvenir: bool, condition: t.Optional[str]) -> str:
+    parts = [
+        name_base or "",
+        ("StatTrak" if stattrak else ""),
+        ("Souvenir" if souvenir else ""),
+        condition or "",
+    ]
+    return "|".join([p for p in parts if p != ""]).strip()
+
+
+def iter_prices_csv(url: str = WHITEMARKET_PRICES_CSV) -> t.Iterable[dict]:
+    headers = {"Accept": "text/csv"}
+    api_token = os.environ.get("WHITEMARKET_API_TOKEN")
+    if api_token:
+        headers["Authorization"] = f"Bearer {api_token}"
+    with requests.get(url, headers=headers, stream=True, timeout=180) as resp:
+        resp.raise_for_status()
+        text_stream = io.TextIOWrapper(resp.raw, encoding="utf-8", errors="ignore")
+        reader = csv.DictReader(text_stream)
+        for row in reader:
+            yield {
+                "market_hash_name": (row.get("market_hash_name") or "").strip(),
+                "price": (row.get("price") or "").strip(),
+                "market_product_count": (row.get("market_product_count") or "").strip(),
+            }
+
+
+def upsert_market_rows(sb, rows: list[dict]):
+    for batch in chunked(rows, UPSERT_BATCH):
+        sb.table(MARKET_TABLE).upsert(batch, on_conflict="item_key").execute()
+
+
+def run_whitemarket_ingest() -> int:
+    print("[whitemarket] Iniciando ingest CSV de preços")
+    sb = get_supabase_client()
+    aggregated: dict[str, dict] = {}
+    raw_count = 0
+
+    try:
+        for row in iter_prices_csv(WHITEMARKET_PRICES_CSV):
+            name = row["market_hash_name"]
+            if not name:
+                continue
+            price_str = row["price"]
+            count_str = row["market_product_count"]
+            try:
+                price = float(price_str.replace(",", ".")) if price_str else None
+            except Exception:
+                price = None
+            try:
+                qty = int(count_str) if count_str and count_str.isdigit() else 0
+            except Exception:
+                qty = 0
+            if price is None or price <= 0:
+                continue
+
+            name_base, stattrak, souvenir, condition = parse_market_hash_name(name)
+            if not name_base:
+                continue
+            item_key = build_item_key(name_base, stattrak, souvenir, condition)
+
+            rec = aggregated.get(item_key)
+            if rec is None:
+                aggregated[item_key] = {
+                    "item_key": item_key,
+                    "name_base": name_base,
+                    "stattrak": bool(stattrak),
+                    "souvenir": bool(souvenir),
+                    "condition": condition,
+                    "price_whitemarket": float(price),
+                    "qty_whitemarket": int(qty),
+                    "fetched_at": datetime.now(timezone.utc).isoformat(),
+                }
+            else:
+                try:
+                    cur = float(rec.get("price_whitemarket"))
+                except Exception:
+                    cur = None
+                if cur is None or price < cur:
+                    rec["price_whitemarket"] = float(price)
+                rec["qty_whitemarket"] = int(rec.get("qty_whitemarket", 0)) + int(qty)
+            raw_count += 1
+
+        # flush
+        rows = []
+        for _, rec in aggregated.items():
+            rows.append({
+                "item_key": rec["item_key"],
+                "name_base": rec["name_base"],
+                "stattrak": bool(rec["stattrak"]),
+                "souvenir": bool(rec["souvenir"]),
+                "condition": rec["condition"],
+                "price_whitemarket": float(rec["price_whitemarket"]),
+                "qty_whitemarket": int(rec["qty_whitemarket"]),
+                "fetched_at": rec["fetched_at"],
+            })
+        if rows:
+            upsert_market_rows(sb, rows)
+        print(f"[whitemarket] Finalizado: {len(rows)} itens únicos de {raw_count} lidos")
+        return len(rows)
+    except Exception as e:
+        print(f"[whitemarket] Erro crítico: {e}")
+        return 0
+
+
+if __name__ == "__main__":
+    count = run_whitemarket_ingest()
+    print(f"[whitemarket] itens agregados: {count}")
+
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 import os
 import gzip
 import io
